@@ -17,7 +17,8 @@ func init() {
 	Commands = map[string]cli.CommandFactory{
 		"agent": func() (cli.Command, error) {
 			return &command.AgentCommand{
-				Ui: ui,
+				Ui:         ui,
+				ShutdownCh: makeShutdownCh(),
 			}, nil
 		},
 		"version": func() (cli.Command, error) {

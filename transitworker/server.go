@@ -15,3 +15,7 @@ func NewServier(config *Config) (*Server, error) {
 
 	return s, nil
 }
+
+func (s *Server) Shutdown() error {
+	return nil
+}
