@@ -13,7 +13,7 @@ type Config struct {
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	config := &Config{
-		Address:     "http://127.0.0.1:8282",
+		Address:     "127.0.0.1:8282",
 		VaultConfig: DefaultVaultConfig(),
 	}
 

@@ -36,14 +36,11 @@ func init() {
 func makeShutdownCh() <-chan struct{} {
 	resultCh := make(chan struct{})
 
-	signalCh := make(chan os.Signal, 4)
-	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		for {
-			<-signalCh
-			resultCh <- struct{}{}
-		}
+		<-shutdownCh
+		close(resultCh)
 	}()
-
 	return resultCh
 }

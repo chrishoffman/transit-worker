@@ -1,8 +1,8 @@
 package command
 
 import (
+	"fmt"
 	"log"
-	"net/http"
 	"strings"
 
 	"github.com/chrishoffman/transit-worker/transitworker"
@@ -28,11 +28,16 @@ Options:
 }
 
 func (c *AgentCommand) Run(args []string) int {
+	log.Println("Starting transit-worker...")
+	c.args = args
 
-	router := transitworker.SetupRoutes()
+	config := transitworker.DefaultConfig()
+	server, err := transitworker.NewServer(config)
+	if err != nil {
+		fmt.Errorf("Unable to set up server: %v", err)
+	}
 
-	go http.ListenAndServe(":8080", router)
-
+	c.server = server
 	return c.handleSignals()
 }
 
@@ -44,10 +49,7 @@ func (c *AgentCommand) Synopsis() string {
 func (c *AgentCommand) handleSignals() int {
 	select {
 	case <-c.ShutdownCh:
-		if err := c.server.Shutdown(); err != nil {
-			log.Println("[INFO] transit-worker: Couldn't properly shutdown the server")
-			return 1
-		}
+		c.server.Shutdown()
 		return 0
 	}
 }
