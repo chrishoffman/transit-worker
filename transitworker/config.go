@@ -1,5 +1,7 @@
 package transitworker
 
+import "os"
+
 type Config struct {
 	// Address is the address of the transit worker agent
 	Address string
@@ -10,10 +12,14 @@ type Config struct {
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
-	c := &Config{
+	config := &Config{
 		Address:     "http://127.0.0.1:8282",
 		VaultConfig: DefaultVaultConfig(),
 	}
 
-	return c
+	if addr := os.Getenv("TRANSIT_WORKER_ADDR"); addr != "" {
+		config.Address = addr
+	}
+
+	return config
 }
