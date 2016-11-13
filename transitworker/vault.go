@@ -24,18 +24,13 @@ type VaultConfig struct {
 	// Addr is the address of the local Vault agent. This should be a complete
 	// URL such as "http://vault.example.com"
 	Addr string
-
-	// ConnectionRetryIntv is the interval to wait before re-attempting to
-	// connect to Vault.
-	ConnectionRetryIntv time.Duration
 }
 
 // DefaultVaultConfig() returns the canonical defaults for the Nomad
 // `vault` configuration.
 func DefaultVaultConfig() *VaultConfig {
 	return &VaultConfig{
-		Addr:                "https://vault.service.consul:8200",
-		ConnectionRetryIntv: DefaultVaultConnectRetryIntv,
+		Addr: "https://vault.service.consul:8200",
 	}
 }
 
