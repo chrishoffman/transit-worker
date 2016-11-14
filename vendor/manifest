@@ -26,6 +26,14 @@
 			"notests": true
 		},
 		{
+			"importpath": "github.com/hashicorp/go-uuid",
+			"repository": "https://github.com/hashicorp/go-uuid",
+			"vcs": "git",
+			"revision": "64130c7a86d732268a38cb04cfbaf0cc987fda98",
+			"branch": "master",
+			"notests": true
+		},
+		{
 			"importpath": "github.com/hashicorp/vault/api",
 			"repository": "https://github.com/hashicorp/vault",
 			"vcs": "git",

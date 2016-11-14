@@ -16,7 +16,7 @@ type Server struct {
 
 func NewServer(config *Config) (*Server, error) {
 	router := httprouter.New()
-	router.GET("/v1/:mount/encrypt/:name", handlers.Hello)
+	router.POST("/v1/:mount/encrypt/:name", handlers.EncryptEndpoint)
 
 	httpServer := manners.NewServer()
 	httpServer.Addr = config.Address
@@ -28,6 +28,7 @@ func NewServer(config *Config) (*Server, error) {
 		httpServer: httpServer,
 	}
 
+	// Start server
 	go s.httpServer.ListenAndServe()
 
 	return s, nil

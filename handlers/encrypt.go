@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	uuid "github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/helper/keysutil"
 	"github.com/julienschmidt/httprouter"
 )
@@ -58,11 +59,34 @@ func EncryptEndpoint(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 		}
 	}
 
-	policy := &keysutil.Policy{}
+	// Generate a 256bit key
+	newKey, err := uuid.GenerateRandomBytes(32)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	}
+
+	entry := keysutil.KeyEntry{
+		AESKey: newKey,
+	}
+	keys := keysutil.KeyEntryMap{
+		1: entry,
+	}
+
+	policy := &keysutil.Policy{
+		Type:          keysutil.KeyType_AES256_GCM96,
+		LatestVersion: 1,
+		Keys:          keys,
+	}
 
 	ciphertext, err := policy.Encrypt(context, nonce, req.Plaintext)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	if ciphertext == "" {
 		http.Error(w, "empty ciphertext returned", http.StatusInternalServerError)
+		return
 	}
 
 	rsp := EncryptResponse{
