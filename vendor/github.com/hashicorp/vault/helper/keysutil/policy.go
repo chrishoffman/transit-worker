@@ -106,10 +106,10 @@ type KeyEntry struct {
 }
 
 // keyEntryMap is used to allow JSON marshal/unmarshal
-type KeyEntryMap map[int]KeyEntry
+type keyEntryMap map[int]KeyEntry
 
 // MarshalJSON implements JSON marshaling
-func (kem KeyEntryMap) MarshalJSON() ([]byte, error) {
+func (kem keyEntryMap) MarshalJSON() ([]byte, error) {
 	intermediate := map[string]KeyEntry{}
 	for k, v := range kem {
 		intermediate[strconv.Itoa(k)] = v
@@ -118,7 +118,7 @@ func (kem KeyEntryMap) MarshalJSON() ([]byte, error) {
 }
 
 // MarshalJSON implements JSON unmarshaling
-func (kem KeyEntryMap) UnmarshalJSON(data []byte) error {
+func (kem keyEntryMap) UnmarshalJSON(data []byte) error {
 	intermediate := map[string]KeyEntry{}
 	if err := jsonutil.DecodeJSON(data, &intermediate); err != nil {
 		return err
@@ -138,7 +138,7 @@ func (kem KeyEntryMap) UnmarshalJSON(data []byte) error {
 type Policy struct {
 	Name string      `json:"name"`
 	Key  []byte      `json:"key,omitempty"` //DEPRECATED
-	Keys KeyEntryMap `json:"keys"`
+	Keys keyEntryMap `json:"keys"`
 
 	// Derived keys MUST provide a context and the master underlying key is
 	// never used. If convergent encryption is true, the context will be used
@@ -749,7 +749,7 @@ func (p *Policy) Rotate(storage logical.Storage) error {
 		// This is an initial key rotation when generating a new policy. We
 		// don't need to call migrate here because if we've called getPolicy to
 		// get the policy in the first place it will have been run.
-		p.Keys = KeyEntryMap{}
+		p.Keys = keyEntryMap{}
 	}
 
 	p.LatestVersion += 1
@@ -808,7 +808,7 @@ func (p *Policy) Rotate(storage logical.Storage) error {
 }
 
 func (p *Policy) MigrateKeyToKeysMap() {
-	p.Keys = KeyEntryMap{
+	p.Keys = keyEntryMap{
 		1: KeyEntry{
 			AESKey:       p.Key,
 			CreationTime: time.Now().Unix(),

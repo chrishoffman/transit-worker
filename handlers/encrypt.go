@@ -68,15 +68,12 @@ func EncryptEndpoint(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 	entry := keysutil.KeyEntry{
 		AESKey: newKey,
 	}
-	keys := keysutil.KeyEntryMap{
-		1: entry,
-	}
 
 	policy := &keysutil.Policy{
 		Type:          keysutil.KeyType_AES256_GCM96,
 		LatestVersion: 1,
-		Keys:          keys,
 	}
+	policy.Keys[1] = entry
 
 	ciphertext, err := policy.Encrypt(context, nonce, req.Plaintext)
 	if err != nil {
