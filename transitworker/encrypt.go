@@ -2,14 +2,16 @@ package transitworker
 
 import (
 	"errors"
-	"net/http"
+	"fmt"
 
 	uuid "github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/helper/keysutil"
 )
 
 func Encrypt() error {
-	// Generate a 256bit key (TEMP)
+
+	// TEMP Data
+	var context, nonce []byte
 	newKey, err := uuid.GenerateRandomBytes(32)
 	if err != nil {
 		return errors.New("unable to generate random key")
@@ -22,17 +24,18 @@ func Encrypt() error {
 	policy := &keysutil.Policy{
 		Type:          keysutil.KeyType_AES256_GCM96,
 		LatestVersion: 1,
+		Keys:          map[int]keysutil.KeyEntry{1: entry},
 	}
-	policy.Keys[1] = entry
 
-	ciphertext, err := policy.Encrypt(context, nonce, req.Plaintext)
+	ciphertext, err := policy.Encrypt(context, nonce, "temp")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
 
 	if ciphertext == "" {
 		return errors.New("empty ciphertext returned")
 	}
 
+	fmt.Println(ciphertext)
+	return nil
 }

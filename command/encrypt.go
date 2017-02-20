@@ -1,6 +1,9 @@
 package command
 
-import "github.com/mitchellh/cli"
+import (
+	"github.com/chrishoffman/transit-worker/transitworker"
+	"github.com/mitchellh/cli"
+)
 
 type EncryptCommand struct {
 	Ui cli.Ui
@@ -11,6 +14,7 @@ func (c *EncryptCommand) Help() string {
 }
 
 func (c *EncryptCommand) Run(_ []string) int {
+	transitworker.Encrypt()
 	return 0
 }
 
