@@ -2,8 +2,6 @@ package main
 
 import (
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/chrishoffman/transit-worker/command"
 	"github.com/mitchellh/cli"
@@ -15,10 +13,9 @@ var Commands map[string]cli.CommandFactory
 func init() {
 	ui := &cli.BasicUi{Writer: os.Stdout}
 	Commands = map[string]cli.CommandFactory{
-		"agent": func() (cli.Command, error) {
-			return &command.AgentCommand{
-				Ui:         ui,
-				ShutdownCh: makeShutdownCh(),
+		"encrypt": func() (cli.Command, error) {
+			return &command.EncryptCommand{
+				Ui: ui,
 			}, nil
 		},
 		"version": func() (cli.Command, error) {
@@ -28,19 +25,4 @@ func init() {
 			}, nil
 		},
 	}
-}
-
-// makeShutdownCh returns a channel that can be used for shutdown
-// notifications for commands. This channel will send a message for every
-// interrupt or SIGTERM received.
-func makeShutdownCh() <-chan struct{} {
-	resultCh := make(chan struct{})
-
-	shutdownCh := make(chan os.Signal, 1)
-	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-shutdownCh
-		close(resultCh)
-	}()
-	return resultCh
 }

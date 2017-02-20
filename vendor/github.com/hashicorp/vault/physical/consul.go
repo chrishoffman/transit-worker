@@ -1,6 +1,7 @@
 package physical
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -21,6 +22,8 @@ import (
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/go-cleanhttp"
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/vault/helper/consts"
 	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/helper/tlsutil"
 )
@@ -47,6 +50,14 @@ const (
 	// reconcileTimeout is how often Vault should query Consul to detect
 	// and fix any state drift.
 	reconcileTimeout = 60 * time.Second
+
+	// consistencyModeDefault is the configuration value used to tell
+	// consul to use default consistency.
+	consistencyModeDefault = "default"
+
+	// consistencyModeStrong is the configuration value used to tell
+	// consul to use strong consistency.
+	consistencyModeStrong = "strong"
 )
 
 type notifyEvent struct{}
@@ -67,6 +78,7 @@ type ConsulBackend struct {
 	serviceTags         []string
 	disableRegistration bool
 	checkTimeout        time.Duration
+	consistencyMode     string
 
 	notifyActiveCh chan notifyEvent
 	notifySealedCh chan notifyEvent
@@ -145,6 +157,10 @@ func newConsulBackend(conf map[string]string, logger log.Logger) (Backend, error
 
 	// Configure the client
 	consulConf := api.DefaultConfig()
+	// Set MaxIdleConnsPerHost to the number of processes used in expiration.Restore
+	tr := cleanhttp.DefaultPooledTransport()
+	tr.MaxIdleConnsPerHost = consts.ExpirationRestoreWorkerCount
+	consulConf.HttpClient.Transport = tr
 
 	if addr, ok := conf["address"]; ok {
 		consulConf.Address = addr
@@ -170,7 +186,7 @@ func newConsulBackend(conf map[string]string, logger log.Logger) (Backend, error
 		}
 
 		transport := cleanhttp.DefaultPooledTransport()
-		transport.MaxIdleConnsPerHost = 4
+		transport.MaxIdleConnsPerHost = consts.ExpirationRestoreWorkerCount
 		transport.TLSClientConfig = tlsClientConfig
 		consulConf.HttpClient.Transport = transport
 		logger.Debug("physical/consul: configured TLS")
@@ -193,6 +209,17 @@ func newConsulBackend(conf map[string]string, logger log.Logger) (Backend, error
 		}
 	}
 
+	consistencyMode, ok := conf["consistency_mode"]
+	if ok {
+		switch consistencyMode {
+		case consistencyModeDefault, consistencyModeStrong:
+		default:
+			return nil, fmt.Errorf("invalid consistency_mode value: %s", consistencyMode)
+		}
+	} else {
+		consistencyMode = consistencyModeDefault
+	}
+
 	// Setup the backend
 	c := &ConsulBackend{
 		path:                path,
@@ -204,6 +231,7 @@ func newConsulBackend(conf map[string]string, logger log.Logger) (Backend, error
 		serviceTags:         strutil.ParseDedupAndSortStrings(tags, ","),
 		checkTimeout:        checkTimeout,
 		disableRegistration: disableRegistration,
+		consistencyMode:     consistencyMode,
 	}
 	return c, nil
 }
@@ -263,16 +291,58 @@ func setupTLSConfig(conf map[string]string) (*tls.Config, error) {
 	return tlsClientConfig, nil
 }
 
+// Used to run multiple entries via a transaction
+func (c *ConsulBackend) Transaction(txns []TxnEntry) error {
+	if len(txns) == 0 {
+		return nil
+	}
+
+	ops := make([]*api.KVTxnOp, 0, len(txns))
+
+	for _, op := range txns {
+		cop := &api.KVTxnOp{
+			Key: c.path + op.Entry.Key,
+		}
+		switch op.Operation {
+		case DeleteOperation:
+			cop.Verb = api.KVDelete
+		case PutOperation:
+			cop.Verb = api.KVSet
+			cop.Value = op.Entry.Value
+		default:
+			return fmt.Errorf("%q is not a supported transaction operation", op.Operation)
+		}
+
+		ops = append(ops, cop)
+	}
+
+	ok, resp, _, err := c.kv.Txn(ops, nil)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+
+	var retErr *multierror.Error
+	for _, res := range resp.Errors {
+		retErr = multierror.Append(retErr, errors.New(res.What))
+	}
+
+	return retErr
+}
+
 // Put is used to insert or update an entry
 func (c *ConsulBackend) Put(entry *Entry) error {
 	defer metrics.MeasureSince([]string{"consul", "put"}, time.Now())
+
+	c.permitPool.Acquire()
+	defer c.permitPool.Release()
+
 	pair := &api.KVPair{
 		Key:   c.path + entry.Key,
 		Value: entry.Value,
 	}
-
-	c.permitPool.Acquire()
-	defer c.permitPool.Release()
 
 	_, err := c.kv.Put(pair, nil)
 	return err
@@ -285,7 +355,14 @@ func (c *ConsulBackend) Get(key string) (*Entry, error) {
 	c.permitPool.Acquire()
 	defer c.permitPool.Release()
 
-	pair, _, err := c.kv.Get(c.path+key, nil)
+	var queryOptions *api.QueryOptions
+	if c.consistencyMode == consistencyModeStrong {
+		queryOptions = &api.QueryOptions{
+			RequireConsistent: true,
+		}
+	}
+
+	pair, _, err := c.kv.Get(c.path+key, queryOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -348,9 +425,10 @@ func (c *ConsulBackend) LockWith(key, value string) (Lock, error) {
 		return nil, fmt.Errorf("failed to create lock: %v", err)
 	}
 	cl := &ConsulLock{
-		client: c.client,
-		key:    c.path + key,
-		lock:   lock,
+		client:          c.client,
+		key:             c.path + key,
+		lock:            lock,
+		consistencyMode: c.consistencyMode,
 	}
 	return cl, nil
 }
@@ -377,9 +455,10 @@ func (c *ConsulBackend) DetectHostAddr() (string, error) {
 
 // ConsulLock is used to provide the Lock interface backed by Consul
 type ConsulLock struct {
-	client *api.Client
-	key    string
-	lock   *api.Lock
+	client          *api.Client
+	key             string
+	lock            *api.Lock
+	consistencyMode string
 }
 
 func (c *ConsulLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
@@ -393,7 +472,14 @@ func (c *ConsulLock) Unlock() error {
 func (c *ConsulLock) Value() (bool, string, error) {
 	kv := c.client.KV()
 
-	pair, _, err := kv.Get(c.key, nil)
+	var queryOptions *api.QueryOptions
+	if c.consistencyMode == consistencyModeStrong {
+		queryOptions = &api.QueryOptions{
+			RequireConsistent: true,
+		}
+	}
+
+	pair, _, err := kv.Get(c.key, queryOptions)
 	if err != nil {
 		return false, "", err
 	}

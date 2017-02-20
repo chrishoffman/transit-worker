@@ -7,6 +7,12 @@ import (
 	"github.com/mitchellh/cli"
 )
 
+// Version and BuildTime are filled in during build by the Makefile
+var (
+	Version   = "N/A"
+	BuildTime = "N/A"
+)
+
 func main() {
 	args := os.Args[1:]
 

@@ -8,10 +8,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/armon/go-metrics"
 	log "github.com/mgutz/logxi/v1"
 
-	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/vault/helper/consts"
 	"github.com/hashicorp/vault/helper/jsonutil"
 	"github.com/hashicorp/vault/logical"
 )
@@ -92,6 +93,7 @@ func (c *Core) setupExpiration() error {
 	c.tokenStore.SetExpirationManager(mgr)
 
 	// Restore the existing state
+	c.logger.Info("expiration: restoring leases")
 	if err := c.expiration.Restore(); err != nil {
 		return fmt.Errorf("expiration state restore failed: %v", err)
 	}
@@ -119,45 +121,119 @@ func (m *ExpirationManager) Restore() error {
 	defer m.pendingLock.Unlock()
 
 	// Accumulate existing leases
-	existing, err := CollectKeys(m.idView)
+	m.logger.Debug("expiration: collecting leases")
+	existing, err := logical.CollectKeys(m.idView)
 	if err != nil {
 		return fmt.Errorf("failed to scan for leases: %v", err)
 	}
+	m.logger.Debug("expiration: leases collected", "num_existing", len(existing))
 
-	// Restore each key
-	for _, leaseID := range existing {
-		// Load the entry
-		le, err := m.loadEntry(leaseID)
-		if err != nil {
-			return err
-		}
+	// Make the channels used for the worker pool
+	broker := make(chan string)
+	quit := make(chan bool)
+	// Buffer these channels to prevent deadlocks
+	errs := make(chan error, len(existing))
+	result := make(chan *leaseEntry, len(existing))
 
-		// If there is no entry, nothing to restore
-		if le == nil {
-			continue
-		}
+	// Use a wait group
+	wg := &sync.WaitGroup{}
 
-		// If there is no expiry time, don't do anything
-		if le.ExpireTime.IsZero() {
-			continue
-		}
+	// Create 64 workers to distribute work to
+	for i := 0; i < consts.ExpirationRestoreWorkerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-		// Determine the remaining time to expiration
-		expires := le.ExpireTime.Sub(time.Now())
-		if expires <= 0 {
-			expires = minRevokeDelay
-		}
+			for {
+				select {
+				case leaseID, ok := <-broker:
+					// broker has been closed, we are done
+					if !ok {
+						return
+					}
 
-		// Setup revocation timer
-		m.pending[le.LeaseID] = time.AfterFunc(expires, func() {
-			m.expireID(le.LeaseID)
-		})
+					le, err := m.loadEntry(leaseID)
+					if err != nil {
+						errs <- err
+						continue
+					}
+
+					// Write results out to the result channel
+					result <- le
+
+				// quit early
+				case <-quit:
+					return
+				}
+			}
+		}()
 	}
+
+	// Distribute the collected keys to the workers in a go routine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i, leaseID := range existing {
+			if i%500 == 0 {
+				m.logger.Trace("expiration: leases loading", "progress", i)
+			}
+
+			select {
+			case <-quit:
+				return
+
+			default:
+				broker <- leaseID
+			}
+		}
+
+		// Close the broker, causing worker routines to exit
+		close(broker)
+	}()
+
+	// Restore each key by pulling from the result chan
+	for i := 0; i < len(existing); i++ {
+		select {
+		case err := <-errs:
+			// Close all go routines
+			close(quit)
+
+			return err
+
+		case le := <-result:
+
+			// If there is no entry, nothing to restore
+			if le == nil {
+				continue
+			}
+
+			// If there is no expiry time, don't do anything
+			if le.ExpireTime.IsZero() {
+				continue
+			}
+
+			// Determine the remaining time to expiration
+			expires := le.ExpireTime.Sub(time.Now())
+			if expires <= 0 {
+				expires = minRevokeDelay
+			}
+
+			// Setup revocation timer
+			m.pending[le.LeaseID] = time.AfterFunc(expires, func() {
+				m.expireID(le.LeaseID)
+			})
+		}
+	}
+
+	// Let all go routines finish
+	wg.Wait()
+
 	if len(m.pending) > 0 {
 		if m.logger.IsInfo() {
 			m.logger.Info("expire: leases restored", "restored_lease_count", len(m.pending))
 		}
 	}
+
 	return nil
 }
 
@@ -214,9 +290,11 @@ func (m *ExpirationManager) revokeCommon(leaseID string, force, skipToken bool) 
 		return err
 	}
 
-	// Delete the secondary index
-	if err := m.removeIndexByToken(le.ClientToken, le.LeaseID); err != nil {
-		return err
+	// Delete the secondary index, but only if it's a leased secret (not auth)
+	if le.Secret != nil {
+		if err := m.removeIndexByToken(le.ClientToken, le.LeaseID); err != nil {
+			return err
+		}
 	}
 
 	// Clear the expiration handler
@@ -266,16 +344,20 @@ func (m *ExpirationManager) RevokeByToken(te *TokenEntry) error {
 		}
 	}
 
-	tokenLeaseID := path.Join(te.Path, m.tokenStore.SaltID(te.ID))
+	if te.Path != "" {
+		tokenLeaseID := path.Join(te.Path, m.tokenStore.SaltID(te.ID))
 
-	// We want to skip the revokeEntry call as that will call back into
-	// revocation logic in the token store, which is what is running this
-	// function in the first place -- it'd be a deadlock loop. Since the only
-	// place that this function is called is revokeSalted in the token store,
-	// we're already revoking the token, so we just want to clean up the lease.
-	// This avoids spurious revocations later in the log when the timer runs
-	// out, and eases up resource usage.
-	return m.revokeCommon(tokenLeaseID, false, true)
+		// We want to skip the revokeEntry call as that will call back into
+		// revocation logic in the token store, which is what is running this
+		// function in the first place -- it'd be a deadlock loop. Since the only
+		// place that this function is called is revokeSalted in the token store,
+		// we're already revoking the token, so we just want to clean up the lease.
+		// This avoids spurious revocations later in the log when the timer runs
+		// out, and eases up resource usage.
+		return m.revokeCommon(tokenLeaseID, false, true)
+	}
+
+	return nil
 }
 
 func (m *ExpirationManager) revokePrefixCommon(prefix string, force bool) error {
@@ -286,7 +368,7 @@ func (m *ExpirationManager) revokePrefixCommon(prefix string, force bool) error 
 
 	// Accumulate existing leases
 	sub := m.idView.SubView(prefix)
-	existing, err := CollectKeys(sub)
+	existing, err := logical.CollectKeys(sub)
 	if err != nil {
 		return fmt.Errorf("failed to scan for leases: %v", err)
 	}

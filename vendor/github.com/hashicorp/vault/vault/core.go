@@ -1,9 +1,9 @@
 package vault
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/subtle"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/audit"
+	"github.com/hashicorp/vault/helper/consts"
 	"github.com/hashicorp/vault/helper/errutil"
 	"github.com/hashicorp/vault/helper/jsonutil"
 	"github.com/hashicorp/vault/helper/logformat"
@@ -56,17 +57,14 @@ const (
 	// leaderPrefixCleanDelay is how long to wait between deletions
 	// of orphaned leader keys, to prevent slamming the backend.
 	leaderPrefixCleanDelay = 200 * time.Millisecond
+
+	// coreKeyringCanaryPath is used as a canary to indicate to replicated
+	// clusters that they need to perform a rekey operation synchronously; this
+	// isn't keyring-canary to avoid ignoring it when ignoring core/keyring
+	coreKeyringCanaryPath = "core/canary-keyring"
 )
 
 var (
-	// ErrSealed is returned if an operation is performed on
-	// a sealed barrier. No operation is expected to succeed before unsealing
-	ErrSealed = errors.New("Vault is sealed")
-
-	// ErrStandby is returned if an operation is performed on
-	// a standby Vault. No operation is expected to succeed until active.
-	ErrStandby = errors.New("Vault is in standby mode")
-
 	// ErrAlreadyInit is returned if the core is already
 	// initialized. This prevents a re-initialization.
 	ErrAlreadyInit = errors.New("Vault is already initialized")
@@ -87,6 +85,12 @@ var (
 	// step down of the active node, to prevent instantly regrabbing the lock.
 	// It's var not const so that tests can manipulate it.
 	manualStepDownSleepPeriod = 10 * time.Second
+
+	// Functions only in the Enterprise version
+	enterprisePostUnseal = enterprisePostUnsealImpl
+	enterprisePreSeal    = enterprisePreSealImpl
+	startReplication     = startReplicationImpl
+	stopReplication      = stopReplicationImpl
 )
 
 // ReloadFunc are functions that are called when a reload is requested.
@@ -124,10 +128,20 @@ type activeAdvertisement struct {
 	ClusterKeyParams *clusterKeyParams `json:"cluster_key_params,omitempty"`
 }
 
+type unlockInformation struct {
+	Parts [][]byte
+	Nonce string
+}
+
 // Core is used as the central manager of Vault activity. It is the primary point of
 // interface for API handlers and is responsible for managing the logical and physical
 // backends, router, security barrier, and audit trails.
 type Core struct {
+	// N.B.: This is used to populate a dev token down replication, as
+	// otherwise, after replication is started, a dev would have to go through
+	// the generate-root process simply to talk to the new follower cluster.
+	devToken string
+
 	// HABackend may be available depending on the physical backend
 	ha physical.HABackend
 
@@ -167,9 +181,8 @@ type Core struct {
 	standbyStopCh    chan struct{}
 	manualStepDownCh chan struct{}
 
-	// unlockParts has the keys provided to Unseal until
-	// the threshold number of parts is available.
-	unlockParts [][]byte
+	// unlockInfo has the keys provided to Unseal until the threshold number of parts is available, as well as the operation nonce
+	unlockInfo *unlockInformation
 
 	// generateRootProgress holds the shares until we reach enough
 	// to verify the master key
@@ -214,6 +227,10 @@ type Core struct {
 	// out into the configured audit backends
 	auditBroker *AuditBroker
 
+	// auditedHeaders is used to configure which http headers
+	// can be output in the audit logs
+	auditedHeaders *AuditedHeadersConfig
+
 	// systemBarrierView is the barrier view for the system backend
 	systemBarrierView *BarrierView
 
@@ -251,20 +268,24 @@ type Core struct {
 	// reloadFuncsLock controlls access to the funcs
 	reloadFuncsLock sync.RWMutex
 
+	// wrappingJWTKey is the key used for generating JWTs containing response
+	// wrapping information
+	wrappingJWTKey *ecdsa.PrivateKey
+
 	//
 	// Cluster information
 	//
 	// Name
 	clusterName string
-	// Used to modify cluster TLS params
+	// Used to modify cluster parameters
 	clusterParamsLock sync.RWMutex
 	// The private key stored in the barrier used for establishing
 	// mutually-authenticated connections between Vault cluster members
 	localClusterPrivateKey crypto.Signer
 	// The local cluster cert
 	localClusterCert []byte
-	// The cert pool containing the self-signed CA as a trusted CA
-	localClusterCertPool *x509.CertPool
+	// The cert pool containing trusted cluster CAs
+	clusterCertPool *x509.CertPool
 	// The TCP addresses we should use for clustering
 	clusterListenerAddrs []*net.TCPAddr
 	// The setup function that gives us the handler to use
@@ -295,10 +316,16 @@ type Core struct {
 	rpcClientConn *grpc.ClientConn
 	// The grpc forwarding client
 	rpcForwardingClient RequestForwardingClient
+
+	// replicationState keeps the current replication state cached for quick
+	// lookup
+	replicationState consts.ReplicationState
 }
 
 // CoreConfig is used to parameterize a core
 type CoreConfig struct {
+	DevToken string `json:"dev_token" structs:"dev_token" mapstructure:"dev_token"`
+
 	LogicalBackends map[string]logical.Factory `json:"logical_backends" structs:"logical_backends" mapstructure:"logical_backends"`
 
 	CredentialBackends map[string]logical.Factory `json:"credential_backends" structs:"credential_backends" mapstructure:"credential_backends"`
@@ -374,14 +401,28 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 		conf.Logger = logformat.NewVaultLogger(log.LevelTrace)
 	}
 
-	// Wrap the backend in a cache unless disabled
-	if !conf.DisableCache {
-		_, isCache := conf.Physical.(*physical.Cache)
-		_, isInmem := conf.Physical.(*physical.InmemBackend)
-		if !isCache && !isInmem {
-			cache := physical.NewCache(conf.Physical, conf.CacheSize, conf.Logger)
-			conf.Physical = cache
-		}
+	// Setup the core
+	c := &Core{
+		redirectAddr:                     conf.RedirectAddr,
+		clusterAddr:                      conf.ClusterAddr,
+		physical:                         conf.Physical,
+		seal:                             conf.Seal,
+		router:                           NewRouter(),
+		sealed:                           true,
+		standby:                          true,
+		logger:                           conf.Logger,
+		defaultLeaseTTL:                  conf.DefaultLeaseTTL,
+		maxLeaseTTL:                      conf.MaxLeaseTTL,
+		cachingDisabled:                  conf.DisableCache,
+		clusterName:                      conf.ClusterName,
+		clusterCertPool:                  x509.NewCertPool(),
+		clusterListenerShutdownCh:        make(chan struct{}),
+		clusterListenerShutdownSuccessCh: make(chan struct{}),
+	}
+
+	// Wrap the physical backend in a cache layer if enabled and not already wrapped
+	if _, isCache := conf.Physical.(*physical.Cache); !conf.DisableCache && !isCache {
+		c.physical = physical.NewCache(conf.Physical, conf.CacheSize, conf.Logger)
 	}
 
 	if !conf.DisableMlock {
@@ -401,29 +442,10 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 	}
 
 	// Construct a new AES-GCM barrier
-	barrier, err := NewAESGCMBarrier(conf.Physical)
+	var err error
+	c.barrier, err = NewAESGCMBarrier(c.physical)
 	if err != nil {
 		return nil, fmt.Errorf("barrier setup failed: %v", err)
-	}
-
-	// Setup the core
-	c := &Core{
-		redirectAddr:                     conf.RedirectAddr,
-		clusterAddr:                      conf.ClusterAddr,
-		physical:                         conf.Physical,
-		seal:                             conf.Seal,
-		barrier:                          barrier,
-		router:                           NewRouter(),
-		sealed:                           true,
-		standby:                          true,
-		logger:                           conf.Logger,
-		defaultLeaseTTL:                  conf.DefaultLeaseTTL,
-		maxLeaseTTL:                      conf.MaxLeaseTTL,
-		cachingDisabled:                  conf.DisableCache,
-		clusterName:                      conf.ClusterName,
-		localClusterCertPool:             x509.NewCertPool(),
-		clusterListenerShutdownCh:        make(chan struct{}),
-		clusterListenerShutdownSuccessCh: make(chan struct{}),
 	}
 
 	if conf.HAPhysical != nil && conf.HAPhysical.HAEnabled() {
@@ -502,6 +524,15 @@ func (c *Core) Shutdown() error {
 func (c *Core) LookupToken(token string) (*TokenEntry, error) {
 	if token == "" {
 		return nil, fmt.Errorf("missing client token")
+	}
+
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+	if c.sealed {
+		return nil, consts.ErrSealed
+	}
+	if c.standby {
+		return nil, consts.ErrStandby
 	}
 
 	// Many tests don't have a token store running
@@ -633,14 +664,15 @@ func (c *Core) Standby() (bool, error) {
 func (c *Core) Leader() (isLeader bool, leaderAddr string, err error) {
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
-	// Check if HA enabled
-	if c.ha == nil {
-		return false, "", ErrHANotEnabled
-	}
 
 	// Check if sealed
 	if c.sealed {
-		return false, "", ErrSealed
+		return false, "", consts.ErrSealed
+	}
+
+	// Check if HA enabled
+	if c.ha == nil {
+		return false, "", ErrHANotEnabled
 	}
 
 	// Check if we are the leader
@@ -701,7 +733,7 @@ func (c *Core) Leader() (isLeader bool, leaderAddr string, err error) {
 
 	if !oldAdv {
 		// Ensure we are using current values
-		err = c.loadClusterTLS(adv)
+		err = c.loadLocalClusterTLS(adv)
 		if err != nil {
 			return false, "", err
 		}
@@ -723,10 +755,15 @@ func (c *Core) Leader() (isLeader bool, leaderAddr string, err error) {
 }
 
 // SecretProgress returns the number of keys provided so far
-func (c *Core) SecretProgress() int {
+func (c *Core) SecretProgress() (int, string) {
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
-	return len(c.unlockParts)
+	switch c.unlockInfo {
+	case nil:
+		return 0, ""
+	default:
+		return len(c.unlockInfo.Parts), c.unlockInfo.Nonce
+	}
 }
 
 // ResetUnsealProcess removes the current unlock parts from memory, to reset
@@ -737,7 +774,7 @@ func (c *Core) ResetUnsealProcess() {
 	if !c.sealed {
 		return
 	}
-	c.unlockParts = nil
+	c.unlockInfo = nil
 }
 
 // Unseal is used to provide one of the key parts to unseal the Vault.
@@ -777,36 +814,72 @@ func (c *Core) Unseal(key []byte) (bool, error) {
 		return true, nil
 	}
 
+	masterKey, err := c.unsealPart(config, key)
+	if err != nil {
+		return false, err
+	}
+	if masterKey != nil {
+		return c.unsealInternal(masterKey)
+	}
+
+	return false, nil
+}
+
+func (c *Core) unsealPart(config *SealConfig, key []byte) ([]byte, error) {
 	// Check if we already have this piece
-	for _, existing := range c.unlockParts {
-		if bytes.Equal(existing, key) {
-			return false, nil
+	if c.unlockInfo != nil {
+		for _, existing := range c.unlockInfo.Parts {
+			if subtle.ConstantTimeCompare(existing, key) == 1 {
+				return nil, nil
+			}
+		}
+	} else {
+		uuid, err := uuid.GenerateUUID()
+		if err != nil {
+			return nil, err
+		}
+		c.unlockInfo = &unlockInformation{
+			Nonce: uuid,
 		}
 	}
 
 	// Store this key
-	c.unlockParts = append(c.unlockParts, key)
+	c.unlockInfo.Parts = append(c.unlockInfo.Parts, key)
 
 	// Check if we don't have enough keys to unlock
-	if len(c.unlockParts) < config.SecretThreshold {
+	if len(c.unlockInfo.Parts) < config.SecretThreshold {
 		if c.logger.IsDebug() {
-			c.logger.Debug("core: cannot unseal, not enough keys", "keys", len(c.unlockParts), "threshold", config.SecretThreshold)
+			c.logger.Debug("core: cannot unseal, not enough keys", "keys", len(c.unlockInfo.Parts), "threshold", config.SecretThreshold, "nonce", c.unlockInfo.Nonce)
 		}
-		return false, nil
+		return nil, nil
 	}
+
+	// Best-effort memzero of unlock parts once we're done with them
+	defer func() {
+		for i, _ := range c.unlockInfo.Parts {
+			memzero(c.unlockInfo.Parts[i])
+		}
+		c.unlockInfo = nil
+	}()
 
 	// Recover the master key
 	var masterKey []byte
+	var err error
 	if config.SecretThreshold == 1 {
-		masterKey = c.unlockParts[0]
-		c.unlockParts = nil
+		masterKey = make([]byte, len(c.unlockInfo.Parts[0]))
+		copy(masterKey, c.unlockInfo.Parts[0])
 	} else {
-		masterKey, err = shamir.Combine(c.unlockParts)
-		c.unlockParts = nil
+		masterKey, err = shamir.Combine(c.unlockInfo.Parts)
 		if err != nil {
-			return false, fmt.Errorf("failed to compute master key: %v", err)
+			return nil, fmt.Errorf("failed to compute master key: %v", err)
 		}
 	}
+
+	return masterKey, nil
+}
+
+// This must be called with the state write lock held
+func (c *Core) unsealInternal(masterKey []byte) (bool, error) {
 	defer memzero(masterKey)
 
 	// Attempt to unlock
@@ -820,19 +893,21 @@ func (c *Core) Unseal(key []byte) (bool, error) {
 	// Do post-unseal setup if HA is not enabled
 	if c.ha == nil {
 		// We still need to set up cluster info even if it's not part of a
-		// cluster right now
+		// cluster right now. This also populates the cached cluster object.
 		if err := c.setupCluster(); err != nil {
 			c.logger.Error("core: cluster setup failed", "error", err)
 			c.barrier.Seal()
 			c.logger.Warn("core: vault is sealed")
 			return false, err
 		}
+
 		if err := c.postUnseal(); err != nil {
 			c.logger.Error("core: post-unseal setup failed", "error", err)
 			c.barrier.Seal()
 			c.logger.Warn("core: vault is sealed")
 			return false, err
 		}
+
 		c.standby = false
 	} else {
 		// Go to standby mode, wait until we are active to unseal
@@ -929,7 +1004,7 @@ func (c *Core) sealInitCommon(req *logical.Request) (retErr error) {
 		DisplayName: te.DisplayName,
 	}
 
-	if err := c.auditBroker.LogRequest(auth, req, nil); err != nil {
+	if err := c.auditBroker.LogRequest(auth, req, c.auditedHeaders, nil); err != nil {
 		c.logger.Error("core: failed to audit request", "request_path", req.Path, "error", err)
 		retErr = multierror.Append(retErr, errors.New("failed to audit request, cannot continue"))
 		return retErr
@@ -1015,7 +1090,7 @@ func (c *Core) StepDown(req *logical.Request) (retErr error) {
 		DisplayName: te.DisplayName,
 	}
 
-	if err := c.auditBroker.LogRequest(auth, req, nil); err != nil {
+	if err := c.auditBroker.LogRequest(auth, req, c.auditedHeaders, nil); err != nil {
 		c.logger.Error("core: failed to audit request", "request_path", req.Path, "error", err)
 		retErr = multierror.Append(retErr, errors.New("failed to audit request, cannot continue"))
 		return retErr
@@ -1076,6 +1151,8 @@ func (c *Core) sealInternal() error {
 
 	// Do pre-seal teardown if HA is not enabled
 	if c.ha == nil {
+		// Even in a non-HA context we key off of this for some things
+		c.standby = true
 		if err := c.preSeal(); err != nil {
 			c.logger.Error("core: pre-seal teardown failed", "error", err)
 			return fmt.Errorf("internal error")
@@ -1121,11 +1198,21 @@ func (c *Core) postUnseal() (retErr error) {
 		}
 	}()
 	c.logger.Info("core: post-unseal setup starting")
-	if cache, ok := c.physical.(*physical.Cache); ok {
-		cache.Purge()
+
+	// Purge the backend if supported
+	if purgable, ok := c.physical.(physical.Purgable); ok {
+		purgable.Purge()
 	}
+
 	// HA mode requires us to handle keyring rotation and rekeying
 	if c.ha != nil {
+		// We want to reload these from disk so that in case of a rekey we're
+		// not using cached values
+		c.seal.SetBarrierConfig(nil)
+		if c.seal.RecoveryKeySupported() {
+			c.seal.SetRecoveryConfig(nil)
+		}
+
 		if err := c.checkKeyUpgrades(); err != nil {
 			return err
 		}
@@ -1138,6 +1225,12 @@ func (c *Core) postUnseal() (retErr error) {
 		if err := c.scheduleUpgradeCleanup(); err != nil {
 			return err
 		}
+	}
+	if err := enterprisePostUnseal(c); err != nil {
+		return err
+	}
+	if err := c.ensureWrappingKey(); err != nil {
+		return err
 	}
 	if err := c.loadMounts(); err != nil {
 		return err
@@ -1164,6 +1257,9 @@ func (c *Core) postUnseal() (retErr error) {
 		return err
 	}
 	if err := c.setupAudits(); err != nil {
+		return err
+	}
+	if err := c.setupAuditedHeadersConfig(); err != nil {
 		return err
 	}
 	if c.ha != nil {
@@ -1194,6 +1290,7 @@ func (c *Core) preSeal() error {
 		c.metricsCh = nil
 	}
 	var result error
+
 	if c.ha != nil {
 		c.stopClusterListener()
 	}
@@ -1216,11 +1313,32 @@ func (c *Core) preSeal() error {
 	if err := c.unloadMounts(); err != nil {
 		result = multierror.Append(result, errwrap.Wrapf("error unloading mounts: {{err}}", err))
 	}
-	if cache, ok := c.physical.(*physical.Cache); ok {
-		cache.Purge()
+	if err := enterprisePreSeal(c); err != nil {
+		result = multierror.Append(result, err)
+	}
+
+	// Purge the backend if supported
+	if purgable, ok := c.physical.(physical.Purgable); ok {
+		purgable.Purge()
 	}
 	c.logger.Info("core: pre-seal teardown complete")
 	return result
+}
+
+func enterprisePostUnsealImpl(c *Core) error {
+	return nil
+}
+
+func enterprisePreSealImpl(c *Core) error {
+	return nil
+}
+
+func startReplicationImpl(c *Core) error {
+	return nil
+}
+
+func stopReplicationImpl(c *Core) error {
+	return nil
 }
 
 // runStandby is a long running routine that is used when an HA backend
@@ -1541,6 +1659,14 @@ func (c *Core) emitMetrics(stopCh chan struct{}) {
 	}
 }
 
+func (c *Core) ReplicationState() consts.ReplicationState {
+	var state consts.ReplicationState
+	c.clusterParamsLock.RLock()
+	state = c.replicationState
+	c.clusterParamsLock.RUnlock()
+	return state
+}
+
 func (c *Core) SealAccess() *SealAccess {
 	sa := &SealAccess{}
 	sa.SetSeal(c.seal)
@@ -1557,26 +1683,6 @@ func (c *Core) BarrierKeyLength() (min, max int) {
 	return
 }
 
-func (c *Core) ValidateWrappingToken(token string) (bool, error) {
-	if token == "" {
-		return false, fmt.Errorf("token is empty")
-	}
-
-	te, err := c.tokenStore.Lookup(token)
-	if err != nil {
-		return false, err
-	}
-	if te == nil {
-		return false, nil
-	}
-
-	if len(te.Policies) != 1 {
-		return false, nil
-	}
-
-	if te.Policies[0] != responseWrappingPolicyName {
-		return false, nil
-	}
-
-	return true, nil
+func (c *Core) AuditedHeadersConfig() *AuditedHeadersConfig {
+	return c.auditedHeaders
 }

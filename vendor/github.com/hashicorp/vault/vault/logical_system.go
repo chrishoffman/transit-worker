@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/vault/helper/consts"
 	"github.com/hashicorp/vault/helper/duration"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
@@ -20,6 +21,25 @@ var (
 	// This is both for security and to prevent disrupting Vault.
 	protectedPaths = []string{
 		"core",
+	}
+
+	replicationPaths = func(b *SystemBackend) []*framework.Path {
+		return []*framework.Path{
+			&framework.Path{
+				Pattern: "replication/status",
+				Callbacks: map[logical.Operation]framework.OperationFunc{
+					logical.ReadOperation: func(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+						var state consts.ReplicationState
+						resp := &logical.Response{
+							Data: map[string]interface{}{
+								"mode": state.String(),
+							},
+						}
+						return resp, nil
+					},
+				},
+			},
+		}
 	}
 )
 
@@ -39,7 +59,15 @@ func NewSystemBackend(core *Core, config *logical.BackendConfig) (logical.Backen
 				"audit",
 				"audit/*",
 				"raw/*",
+				"replication/primary/secondary-token",
+				"replication/reindex",
 				"rotate",
+				"config/auditing/*",
+			},
+
+			Unauthenticated: []string{
+				"wrapping/pubkey",
+				"replication/status",
 			},
 		},
 
@@ -221,6 +249,11 @@ func NewSystemBackend(core *Core, config *logical.BackendConfig) (logical.Backen
 						Type:        framework.TypeMap,
 						Description: strings.TrimSpace(sysHelp["mount_config"][0]),
 					},
+					"local": &framework.FieldSchema{
+						Type:        framework.TypeBool,
+						Default:     false,
+						Description: strings.TrimSpace(sysHelp["mount_local"][0]),
+					},
 				},
 
 				Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -372,6 +405,11 @@ func NewSystemBackend(core *Core, config *logical.BackendConfig) (logical.Backen
 						Type:        framework.TypeString,
 						Description: strings.TrimSpace(sysHelp["auth_desc"][0]),
 					},
+					"local": &framework.FieldSchema{
+						Type:        framework.TypeBool,
+						Default:     false,
+						Description: strings.TrimSpace(sysHelp["mount_local"][0]),
+					},
 				},
 
 				Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -490,6 +528,11 @@ func NewSystemBackend(core *Core, config *logical.BackendConfig) (logical.Backen
 						Type:        framework.TypeMap,
 						Description: strings.TrimSpace(sysHelp["audit_opts"][0]),
 					},
+					"local": &framework.FieldSchema{
+						Type:        framework.TypeBool,
+						Default:     false,
+						Description: strings.TrimSpace(sysHelp["mount_local"][0]),
+					},
 				},
 
 				Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -541,6 +584,20 @@ func NewSystemBackend(core *Core, config *logical.BackendConfig) (logical.Backen
 				HelpSynopsis:    strings.TrimSpace(sysHelp["rotate"][0]),
 				HelpDescription: strings.TrimSpace(sysHelp["rotate"][1]),
 			},
+
+			/*
+				// Disabled for the moment as we don't support this externally
+				&framework.Path{
+					Pattern: "wrapping/pubkey$",
+
+					Callbacks: map[logical.Operation]framework.OperationFunc{
+						logical.ReadOperation: b.handleWrappingPubkey,
+					},
+
+					HelpSynopsis:    strings.TrimSpace(sysHelp["wrappubkey"][0]),
+					HelpDescription: strings.TrimSpace(sysHelp["wrappubkey"][1]),
+				},
+			*/
 
 			&framework.Path{
 				Pattern: "wrapping/wrap$",
@@ -603,8 +660,44 @@ func NewSystemBackend(core *Core, config *logical.BackendConfig) (logical.Backen
 				HelpSynopsis:    strings.TrimSpace(sysHelp["rewrap"][0]),
 				HelpDescription: strings.TrimSpace(sysHelp["rewrap"][1]),
 			},
+
+			&framework.Path{
+				Pattern: "config/auditing/request-headers/(?P<header>.+)",
+
+				Fields: map[string]*framework.FieldSchema{
+					"header": &framework.FieldSchema{
+						Type: framework.TypeString,
+					},
+					"hmac": &framework.FieldSchema{
+						Type: framework.TypeBool,
+					},
+				},
+
+				Callbacks: map[logical.Operation]framework.OperationFunc{
+					logical.UpdateOperation: b.handleAuditedHeaderUpdate,
+					logical.DeleteOperation: b.handleAuditedHeaderDelete,
+					logical.ReadOperation:   b.handleAuditedHeaderRead,
+				},
+
+				HelpSynopsis:    strings.TrimSpace(sysHelp["audited-headers-name"][0]),
+				HelpDescription: strings.TrimSpace(sysHelp["audited-headers-name"][1]),
+			},
+			&framework.Path{
+				Pattern: "config/auditing/request-headers$",
+
+				Callbacks: map[logical.Operation]framework.OperationFunc{
+					logical.ReadOperation: b.handleAuditedHeadersRead,
+				},
+
+				HelpSynopsis:    strings.TrimSpace(sysHelp["audited-headers"][0]),
+				HelpDescription: strings.TrimSpace(sysHelp["audited-headers"][1]),
+			},
 		},
 	}
+
+	b.Backend.Paths = append(b.Backend.Paths, replicationPaths(b)...)
+
+	b.Backend.Invalidate = b.invalidate
 
 	return b.Backend.Setup(config)
 }
@@ -615,6 +708,84 @@ func NewSystemBackend(core *Core, config *logical.BackendConfig) (logical.Backen
 type SystemBackend struct {
 	Core    *Core
 	Backend *framework.Backend
+}
+
+func (b *SystemBackend) invalidate(key string) {
+	if b.Core.logger.IsTrace() {
+		b.Core.logger.Trace("sys: invaliding key", "key", key)
+	}
+	switch {
+	case strings.HasPrefix(key, policySubPath):
+		b.Core.stateLock.RLock()
+		defer b.Core.stateLock.RUnlock()
+		if b.Core.policyStore != nil {
+			b.Core.policyStore.invalidate(strings.TrimPrefix(key, policySubPath))
+		}
+	}
+}
+
+// handleAuditedHeaderUpdate creates or overwrites a header entry
+func (b *SystemBackend) handleAuditedHeaderUpdate(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	header := d.Get("header").(string)
+	hmac := d.Get("hmac").(bool)
+	if header == "" {
+		return logical.ErrorResponse("missing header name"), nil
+	}
+
+	headerConfig := b.Core.AuditedHeadersConfig()
+	err := headerConfig.add(header, hmac)
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleAudtedHeaderDelete deletes the header with the given name
+func (b *SystemBackend) handleAuditedHeaderDelete(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	header := d.Get("header").(string)
+	if header == "" {
+		return logical.ErrorResponse("missing header name"), nil
+	}
+
+	headerConfig := b.Core.AuditedHeadersConfig()
+	err := headerConfig.remove(header)
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleAuditedHeaderRead returns the header configuration for the given header name
+func (b *SystemBackend) handleAuditedHeaderRead(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	header := d.Get("header").(string)
+	if header == "" {
+		return logical.ErrorResponse("missing header name"), nil
+	}
+
+	headerConfig := b.Core.AuditedHeadersConfig()
+	settings, ok := headerConfig.Headers[header]
+	if !ok {
+		return logical.ErrorResponse("Could not find header in config"), nil
+	}
+
+	return &logical.Response{
+		Data: map[string]interface{}{
+			header: settings,
+		},
+	}, nil
+}
+
+// handleAuditedHeadersRead returns the whole audited headers config
+func (b *SystemBackend) handleAuditedHeadersRead(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	headerConfig := b.Core.AuditedHeadersConfig()
+
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"headers": headerConfig.Headers,
+		},
+	}, nil
 }
 
 // handleCapabilitiesreturns the ACL capabilities of the token for a given path
@@ -754,6 +925,7 @@ func (b *SystemBackend) handleMountTable(
 				"default_lease_ttl": int64(entry.Config.DefaultLeaseTTL.Seconds()),
 				"max_lease_ttl":     int64(entry.Config.MaxLeaseTTL.Seconds()),
 			},
+			"local": entry.Local,
 		}
 
 		resp.Data[entry.Path] = info
@@ -765,6 +937,15 @@ func (b *SystemBackend) handleMountTable(
 // handleMount is used to mount a new path
 func (b *SystemBackend) handleMount(
 	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	b.Core.clusterParamsLock.RLock()
+	repState := b.Core.replicationState
+	b.Core.clusterParamsLock.RUnlock()
+
+	local := data.Get("local").(bool)
+	if !local && repState == consts.ReplicationSecondary {
+		return logical.ErrorResponse("cannot add a non-local mount to a replication secondary"), nil
+	}
+
 	// Get all the options
 	path := data.Get("path").(string)
 	logicalType := data.Get("type").(string)
@@ -839,6 +1020,7 @@ func (b *SystemBackend) handleMount(
 		Type:        logicalType,
 		Description: description,
 		Config:      config,
+		Local:       local,
 	}
 
 	// Attempt mount
@@ -864,12 +1046,21 @@ func handleError(
 // handleUnmount is used to unmount a path
 func (b *SystemBackend) handleUnmount(
 	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	b.Core.clusterParamsLock.RLock()
+	repState := b.Core.replicationState
+	b.Core.clusterParamsLock.RUnlock()
+
 	suffix := strings.TrimPrefix(req.Path, "mounts/")
 	if len(suffix) == 0 {
 		return logical.ErrorResponse("path cannot be blank"), logical.ErrInvalidRequest
 	}
 
 	suffix = sanitizeMountPath(suffix)
+
+	entry := b.Core.router.MatchingMountEntry(suffix)
+	if entry != nil && !entry.Local && repState == consts.ReplicationSecondary {
+		return logical.ErrorResponse("cannot unmount a non-local mount on a replication secondary"), nil
+	}
 
 	// Attempt unmount
 	if existed, err := b.Core.unmount(suffix); existed && err != nil {
@@ -883,6 +1074,10 @@ func (b *SystemBackend) handleUnmount(
 // handleRemount is used to remount a path
 func (b *SystemBackend) handleRemount(
 	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	b.Core.clusterParamsLock.RLock()
+	repState := b.Core.replicationState
+	b.Core.clusterParamsLock.RUnlock()
+
 	// Get the paths
 	fromPath := data.Get("from").(string)
 	toPath := data.Get("to").(string)
@@ -894,6 +1089,11 @@ func (b *SystemBackend) handleRemount(
 
 	fromPath = sanitizeMountPath(fromPath)
 	toPath = sanitizeMountPath(toPath)
+
+	entry := b.Core.router.MatchingMountEntry(fromPath)
+	if entry != nil && !entry.Local && repState == consts.ReplicationSecondary {
+		return logical.ErrorResponse("cannot remount a non-local mount on a replication secondary"), nil
+	}
 
 	// Attempt remount
 	if err := b.Core.remount(fromPath, toPath); err != nil {
@@ -980,6 +1180,10 @@ func (b *SystemBackend) handleMountTuneWrite(
 // handleTuneWriteCommon is used to set config settings on a path
 func (b *SystemBackend) handleTuneWriteCommon(
 	path string, data *framework.FieldData) (*logical.Response, error) {
+	b.Core.clusterParamsLock.RLock()
+	repState := b.Core.replicationState
+	b.Core.clusterParamsLock.RUnlock()
+
 	path = sanitizeMountPath(path)
 
 	// Prevent protected paths from being changed
@@ -994,6 +1198,9 @@ func (b *SystemBackend) handleTuneWriteCommon(
 	if mountEntry == nil {
 		b.Backend.Logger().Error("sys: tune failed: no mount entry found", "path", path)
 		return handleError(fmt.Errorf("sys: tune of path '%s' failed: no mount entry found", path))
+	}
+	if mountEntry != nil && !mountEntry.Local && repState == consts.ReplicationSecondary {
+		return logical.ErrorResponse("cannot tune a non-local mount on a replication secondary"), nil
 	}
 
 	var lock *sync.RWMutex
@@ -1134,6 +1341,7 @@ func (b *SystemBackend) handleAuthTable(
 				"default_lease_ttl": int64(entry.Config.DefaultLeaseTTL.Seconds()),
 				"max_lease_ttl":     int64(entry.Config.MaxLeaseTTL.Seconds()),
 			},
+			"local": entry.Local,
 		}
 		resp.Data[entry.Path] = info
 	}
@@ -1143,6 +1351,15 @@ func (b *SystemBackend) handleAuthTable(
 // handleEnableAuth is used to enable a new credential backend
 func (b *SystemBackend) handleEnableAuth(
 	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	b.Core.clusterParamsLock.RLock()
+	repState := b.Core.replicationState
+	b.Core.clusterParamsLock.RUnlock()
+
+	local := data.Get("local").(bool)
+	if !local && repState == consts.ReplicationSecondary {
+		return logical.ErrorResponse("cannot add a non-local mount to a replication secondary"), nil
+	}
+
 	// Get all the options
 	path := data.Get("path").(string)
 	logicalType := data.Get("type").(string)
@@ -1162,6 +1379,7 @@ func (b *SystemBackend) handleEnableAuth(
 		Path:        path,
 		Type:        logicalType,
 		Description: description,
+		Local:       local,
 	}
 
 	// Attempt enabling
@@ -1276,6 +1494,7 @@ func (b *SystemBackend) handleAuditTable(
 			"type":        entry.Type,
 			"description": entry.Description,
 			"options":     entry.Options,
+			"local":       entry.Local,
 		}
 		resp.Data[entry.Path] = info
 	}
@@ -1309,6 +1528,15 @@ func (b *SystemBackend) handleAuditHash(
 // handleEnableAudit is used to enable a new audit backend
 func (b *SystemBackend) handleEnableAudit(
 	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	b.Core.clusterParamsLock.RLock()
+	repState := b.Core.replicationState
+	b.Core.clusterParamsLock.RUnlock()
+
+	local := data.Get("local").(bool)
+	if !local && repState == consts.ReplicationSecondary {
+		return logical.ErrorResponse("cannot add a non-local mount to a replication secondary"), nil
+	}
+
 	// Get all the options
 	path := data.Get("path").(string)
 	backendType := data.Get("type").(string)
@@ -1332,6 +1560,7 @@ func (b *SystemBackend) handleEnableAudit(
 		Type:        backendType,
 		Description: description,
 		Options:     optionMap,
+		Local:       local,
 	}
 
 	// Attempt enabling
@@ -1447,6 +1676,13 @@ func (b *SystemBackend) handleKeyStatus(
 // handleRotate is used to trigger a key rotation
 func (b *SystemBackend) handleRotate(
 	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	b.Core.clusterParamsLock.RLock()
+	repState := b.Core.replicationState
+	b.Core.clusterParamsLock.RUnlock()
+	if repState == consts.ReplicationSecondary {
+		return logical.ErrorResponse("cannot rotate on a replication secondary"), nil
+	}
+
 	// Rotate to the new term
 	newTerm, err := b.Core.barrier.Rotate()
 	if err != nil {
@@ -1469,12 +1705,36 @@ func (b *SystemBackend) handleRotate(
 			}
 		})
 	}
+
+	// Write to the canary path, which will force a synchronous truing during
+	// replication
+	if err := b.Core.barrier.Put(&Entry{
+		Key:   coreKeyringCanaryPath,
+		Value: []byte(fmt.Sprintf("new-rotation-term-%d", newTerm)),
+	}); err != nil {
+		b.Core.logger.Error("core: error saving keyring canary", "error", err)
+		return nil, fmt.Errorf("failed to save keyring canary: %v", err)
+	}
+
 	return nil, nil
+}
+
+func (b *SystemBackend) handleWrappingPubkey(
+	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	x, _ := b.Core.wrappingJWTKey.X.MarshalText()
+	y, _ := b.Core.wrappingJWTKey.Y.MarshalText()
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"jwt_x":     string(x),
+			"jwt_y":     string(y),
+			"jwt_curve": corePrivateKeyTypeP521,
+		},
+	}, nil
 }
 
 func (b *SystemBackend) handleWrappingWrap(
 	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	if req.WrapTTL == 0 {
+	if req.WrapInfo == nil || req.WrapInfo.TTL == 0 {
 		return logical.ErrorResponse("endpoint requires response wrapping to be used"), logical.ErrInvalidRequest
 	}
 
@@ -1683,7 +1943,7 @@ func (b *SystemBackend) handleWrappingRewrap(
 		Data: map[string]interface{}{
 			"response": response,
 		},
-		WrapInfo: &logical.WrapInfo{
+		WrapInfo: &logical.ResponseWrapInfo{
 			TTL: time.Duration(creationTTL),
 		},
 	}, nil
@@ -1820,6 +2080,11 @@ west coast.
 	"mount_config": {
 		`Configuration for this mount, such as default_lease_ttl
 and max_lease_ttl.`,
+	},
+
+	"mount_local": {
+		`Mark the mount as a local mount, which is not replicated
+and is unaffected by replication.`,
 	},
 
 	"tune_default_lease_ttl": {
@@ -2087,6 +2352,11 @@ Enable a new audit backend or disable an existing backend.
 		`Round trips the given input data into a response-wrapped token.`,
 	},
 
+	"wrappubkey": {
+		"Returns pubkeys used in some wrapping formats.",
+		"Returns pubkeys used in some wrapping formats.",
+	},
+
 	"unwrap": {
 		"Unwraps a response-wrapped token.",
 		`Unwraps a response-wrapped token. Unlike simply reading from cubbyhole/response,
@@ -2103,5 +2373,24 @@ Enable a new audit backend or disable an existing backend.
 		"Rotates a response-wrapped token.",
 		`Rotates a response-wrapped token; the output is a new token with the same
 		response wrapped inside and the same creation TTL. The original token is revoked.`,
+	},
+	"audited-headers-name": {
+		"Configures the headers sent to the audit logs.",
+		`
+This path responds to the following HTTP methods.
+
+	GET /<name>
+		Returns the setting for the header with the given name.
+
+	POST /<name>
+		Enable auditing of the given header.
+
+	DELETE /<path>
+		Disable auditing of the given header.
+		`,
+	},
+	"audited-headers": {
+		"Lists the headers configured to be audited.",
+		`Returns a list of headers that have been configured to be audited.`,
 	},
 }
